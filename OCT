@@ -1,0 +1,331 @@
+import numpy as np
+import gurobipy as gp
+from gurobipy import GRB
+
+
+class OCT_Optimization:
+    def __init__(self, max_depth, alpha, N_min, timelimit = 900, output = False):
+        self.max_depth = int(max_depth)
+        self.alpha = float(alpha)
+        self.N_min = int(N_min)
+        self.timelimit = int(timelimit)
+        self.output = bool(output)
+
+        # Nodes of the tree
+        self.branch_nodes = list(range(1, 2 ** self.max_depth))                         # t = 1,...,2^{D_{max}}-1
+        self.leaf_nodes = list(range(2 ** self.max_depth, 2 ** (self.max_depth + 1)))   # t = 2^{D_{max}},...,2^{D_{max}+1}-1
+
+        # Placeholders filled in fit()
+        self.model = None
+        self.n = None                   # number of samples
+        self.p = None                   # number of features
+        self.K = None                   # number of classes
+        self.classes = None             # unique class labels
+        self.Y = None                   # label matrix Y_{ik} {+1, -1}
+        self.baseline_L_hat = None      # majority class count
+
+        self.epsilon_j = None
+        self.epsilon_max = None
+
+        # Solution holders
+        self.a = None                   # binary feature selector at branch nodes
+        self.b = None                   # continuous threshold at branch nodes
+        self.d = None                   # binary split indicator at branch nodes
+        self.z = None                   # binary indicator if point i reaches leaf t
+        self.l = None                   # binary indicator if leaf t is active
+        self.c = None                   # binary class choice for leaf t
+        self.N = None                   # numbers of samples in leaf t
+        self.N_class = None             # number of samples of class k in leaf t
+        self.L = None                   # misclassification loss at leaf t
+
+        self.trained = False
+        self.mip_gap = None
+        self.obj_val = None
+
+    def fit(self, X, y):
+        # Convert input to numpy arrays
+        X_np = np.asarray(X, dtype = float)
+        y_np = np.asarray(y, dtype = int)
+
+        self.n, self.p = X_np.shape
+
+        X_used = X_np.astype(float)
+
+        self.classes = np.unique(y_np)
+        self.K = len(self.classes)
+
+        # map class labels to indexes
+        class_to_index = {cls: idx for idx, cls in enumerate(self.classes)}
+        y_index = np.array([class_to_index[value] for value in y_np], dtype = int)
+
+        # Build Y_{ik} matrix
+        self.Y = -np.ones((self.n,self.K))      # initialise a matrix full of -1
+        for i in range(self.n):
+            self.Y[i, y_index[i]] = 1.0         # set the correct class column to +1
+
+        # Baseline \hat{L}
+        class_counts = np.bincount(y_index)
+        self.baseline_L_hat = class_counts.max()
+
+        # Epsilon
+        epsilon_j = np.zeros(self.p)
+        for j in range(self.p):
+            x_j = np.unique(X_used[:, j])
+            x_j = np.sort(x_j)                  # arranging from lowest to highest value
+
+            diffs = np.diff(x_j)                # successive differences
+            positive_diffs = diffs[diffs > 0]
+
+            if len(positive_diffs) > 0:
+                epsilon_j[j] = positive_diffs.min()
+            else:
+                epsilon_j[j] = 1.0              # fallback if feature is constant
+
+        self.epsilon_j = epsilon_j
+        self.epsilon_max = epsilon_j.max()
+
+        # build MIP model
+        self._build_model(X_used)
+
+        # solve model with Gurobi
+        self.model.optimize()
+        self.mip_gap = getattr(self.model, 'MIPGap', None)
+        self.obj_val = self.model.ObjVal
+        self.bound = getattr(self.model, 'ObjBound', None)
+        self.runtime = getattr(self.model, 'Runtime', None)
+
+        # solution variables
+        # select splitting features
+        self.a_solution = {
+            (j,t): self.a[j,t].X
+            for j in range(self.p)
+            for t in self.branch_nodes
+        }
+
+        # thresholds
+        self.b_solution = {
+            t: self.b[t].X
+            for t in self.branch_nodes
+        }
+
+        # split indicator
+        self.d_solution = {
+            t: self.d[t].X
+            for t in self.branch_nodes
+        }
+
+        # leaf assignment
+        self.z_solution = {
+            (i,t): self.z[i,t].X
+            for i in range(self.n)
+            for t in self.leaf_nodes
+        }
+
+        # leaf is active
+        self.l_solution = {
+            t: self.l[t].X
+            for t in self.leaf_nodes
+        }
+
+        # chosen leaf class
+        self.c_solution = {
+            (k,t): self.c[k,t].X
+            for k in range(self.K)
+            for t in self.leaf_nodes
+        }
+
+        # number of points in leaf t
+        self.N_solution = {
+            t: self.N[t].X
+            for t in self.leaf_nodes
+        }
+
+        # class counts per leaf
+        self.N_class_solution = {
+            (k,t): self.N_class[k,t].X
+            for k in range(self.K)
+            for t in self.leaf_nodes
+        }
+
+        # misclassification loss in leaf t
+        self.L_solution = {
+            t: self.L[t].X
+            for t in self.leaf_nodes
+        }
+
+        self.trained = True
+        return self
+
+    def _build_model(self, X_used):
+        n = self.n
+        p = self.p
+        K = self.K
+        Y = self.Y
+
+        model = gp.Model("OCT")
+        model.Params.LogToConsole = 1 if self.output else 0
+        model.Params.TimeLimit = self.timelimit
+
+        T_B = self.branch_nodes
+        T_L = self.leaf_nodes
+
+        # variables
+        self.a = model.addVars(range(p), T_B, vtype = GRB.BINARY, name = "a")
+        self.b = model.addVars(T_B, vtype = GRB.CONTINUOUS, lb=0.0, ub=1.0, name = "b")
+        self.d = model.addVars(T_B, vtype = GRB.BINARY, name = "d")
+        self.z = model.addVars(range(n), T_L, vtype = GRB.BINARY, name = "z")
+        self.l = model.addVars(T_L, vtype = GRB.BINARY, name = "l")
+        self.c = model.addVars(range(K), T_L, vtype = GRB.BINARY, name = "c")
+        self.N = model.addVars(T_L, vtype = GRB.CONTINUOUS, name = "N")
+        self.N_class = model.addVars(range(K), T_L, vtype = GRB.CONTINUOUS, lb=0.0, name = "N_class")
+        self.L = model.addVars(T_L, vtype = GRB.CONTINUOUS, lb=0.0, name = "L")
+
+        # constraints
+        # Equation 4.2
+        for t in T_B:
+            model.addConstr(gp.quicksum(self.a[j,t] for j in range(p)) == self.d[t], name = "(1)")
+
+        # Equation 4.3
+        for t in T_B:
+            model.addConstr(self.b[t] <= self.d[t], name = "(2)")
+
+        # Equation 4.5
+        for t in T_B:
+            if t != 1:  # root has no parent
+                parent = t // 2
+                model.addConstr(self.d[t] <= self.d[parent], name="(3)")
+
+        # Equation 4.8
+        for t in T_L:
+            for i in range(n):
+                model.addConstr(self.z[i,t] <= self.l[t], name = "(4)")
+
+        # Equation 4.9
+        for t in T_L:
+                model.addConstr(gp.quicksum(self.z[i,t] for i in range(n)) >= self.N_min * self.l[t], name = "(5)")
+
+        # Equation 4.10
+        for i in range(n):
+            model.addConstr(gp.quicksum(self.z[i,t] for t in T_L) == 1, name = "(6)")
+
+        # Equation 4.17 and 4.18
+        M1 = 1.0 + float(self.epsilon_max)
+
+        for t in T_L:
+            for i in range(n):
+                x_i = X_used[i, :]
+
+                # walk up the tree
+                node = t
+                while node != 1:
+                    parent = node // 2
+                    is_left_child = (node == 2 * parent)
+
+                    if is_left_child:
+                        # left branch constraint
+                        lhs = gp.quicksum(self.a[j, parent] * (x_i[j] + self.epsilon_j[j]) for j in range(p)) + M1 * (1 - self.d[parent])
+                        model.addConstr(lhs <= self.b[parent] + M1 * (1 - self.z[i, t]))
+                    else:
+                        # right branch constraint
+                        lhs = gp.quicksum(self.a[j, parent] * x_i[j] for j in range(p))
+                        model.addConstr(lhs >= self.b[parent] - (1 - self.z[i, t]))
+
+                    node = parent
+
+        # Equation 4.20
+        for t in T_L:
+            model.addConstr(self.N[t] == gp.quicksum(self.z[i,t] for i in range(n)), name = "(9)")
+
+        # Equation 4.21
+        for t in T_L:
+            for k in range(K):
+                model.addConstr(self.N_class[k,t] == 0.5 * gp.quicksum((1+Y[i,k]) * self.z[i,t] for i in range(n)), name = "(10)")
+
+        # Equation 4.24
+        for t in T_L:
+            model.addConstr(gp.quicksum(self.c[k,t] for k in range(K)) == self.l[t], name = "(11)")
+
+        # Equation 4.26
+        for t in T_L:
+            for k in range(K):
+                model.addConstr(self.L[t] >= self.N[t] - self.N_class[k,t] - self.n * (1 - self.c[k,t]), name = "(12)")
+
+        # Equation 4.27
+        for t in T_L:
+            for k in range(K):
+                model.addConstr(self.L[t] <= self.N[t] - self.N_class[k, t] + self.n * self.c[k, t], name="(13)")
+
+        # (Equation 4.28: L_t \geq 0, is already enforced by variable domain)
+
+        # Objective
+        model.setObjective((1.0 / self.baseline_L_hat) * gp.quicksum(self.L[t] for t in T_L) + self.alpha * gp.quicksum(self.d[t] for t in T_B), GRB.MINIMIZE)
+
+        self.model = model
+
+    def predict(self, X):
+        if not self.trained:
+            raise ValueError("Optimizer not trained")
+
+        # convert to numpy arrays
+        X_np = np.asarray(X, dtype=float)
+
+        X_used = X_np.astype(float)
+
+        predictions = []
+
+        for x_i in X_used:
+            t = 1  # start at the root
+
+            while t in self.branch_nodes:
+                selected_feature = None
+                for j in range(self.p):
+                    if round(self.a_solution.get((j, t), 0)) == 1:
+                        selected_feature = j
+                        break
+
+                if selected_feature is None:
+                    t = 2 * t + 1  # no feature (branch not used) => always go right
+                    continue
+
+                threshold = self.b_solution[t]
+
+                if x_i[selected_feature] < threshold:
+                    t = 2 * t
+                else:
+                    t = 2 * t + 1
+
+            chosen_class = None
+            best_value = -1
+
+            for k in range(self.K):
+                if self.c_solution.get((k, t), 0) > best_value:
+                    best_value = self.c_solution[(k, t)]
+                    chosen_class = self.classes[k]
+
+            predictions.append(chosen_class)
+
+        return np.array(predictions)
+
+    def split_feature_map(self, feature_names = None):
+        if not self.trained:
+            raise ValueError("Model has not been trained")
+        if feature_names is not None and len(feature_names) != self.p:
+            raise ValueError("Number of feature names does not match F")
+
+        splits = {}
+
+        for t in self.branch_nodes:
+            if round(self.d_solution[t]) == 0:                  # d_t = 0 no split
+                continue
+
+            selected_feature = None
+            for j in range(self.p):
+                if round(self.a_solution.get((j, t), 0)) == 1:      # a[j,t] = 1
+                    selected_feature = j
+                    break
+
+            if feature_names is None:
+                splits[t] = selected_feature
+            else:
+                splits[t] = feature_names[selected_feature]
+        return dict(sorted(splits.items()))
