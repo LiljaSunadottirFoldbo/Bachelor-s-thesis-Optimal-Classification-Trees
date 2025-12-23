@@ -1,0 +1,97 @@
+# Flow-based tree structure
+
+class TreeStructure:
+    def __init__(self, max_depth: int):
+        self.max_depth = int(max_depth)
+
+        # Nodes of the tree
+        self.nodes = list(range(1,2 ** (self.max_depth + 1)))                           # t = 1,...,T=2^{D_{\max}+1}-1
+        self.branch_nodes = list(range(1,2 ** self.max_depth))                          # t = 1,...,2^{D_{max}}-1
+        self.leaf_nodes = list(range(2 ** self.max_depth, 2 ** (self.max_depth + 1)))   # t = 2^{D_{max}},...,2^{D_{max}+1}-1
+
+        # Arc sets (filled by build_graph)
+        self.edges = []
+        self.inner_edges = []
+        self.parent_arcs = []
+        self.left_arcs = []
+        self.right_arcs = []
+        self.source_root_arc = []
+        self.tau_arcs = []
+
+        #Special nodes (set by build_graph)
+        self.source = None
+        self.root = None
+        self.tau = None
+
+    def build_graph(self) -> dict:
+        edges = []               # all arcs
+        inner_edges = []         # parent -> child arcs inside the tree
+        parent_arcs = []         # incoming arcs (a(t) -> t)
+        left_arcs = []           # left arcs (t -> 2t)
+        right_arcs = []          # right arcs (t -> 2t+1)
+        source_root_arc = []     # source -> root arcs
+        tau_arcs = []            # leaf -> tau arcs
+
+        source = 0
+        root = 1
+        tau = 2 ** (self.max_depth +1)    #sink node is one above max tree node
+        max_idx = self.nodes[-1]
+
+        # Add inner left and right arcs for every branch node
+        for n in self.branch_nodes:
+            left = 2 * n
+            right = 2 * n + 1
+
+            if left <= max_idx:
+                edges.append((n, left))
+                inner_edges.append((n, left))
+                parent_arcs.append((n, left))          # parent -> child arcs
+                left_arcs.append((n, left))            # keep track of left arcs
+
+            if right <= max_idx:
+                edges.append((n, right))
+                inner_edges.append((n, right))
+                parent_arcs.append((n, right))          # incoming arc for its child
+                right_arcs.append((n, right))           # keep track of right arcs
+
+        # Add the source -> root arc
+        edges.append((source, root))
+        source_root_arc.append((source, root))
+        parent_arcs.append((source, root))              # incoming arc to the root
+
+        # Add the leaf -> sink arc
+        for l in self.leaf_nodes:
+            edges.append((l, tau))
+            tau_arcs.append((l, tau))
+
+        # Store constructed set in memory for later use
+        self.edges = edges
+        self.inner_edges = inner_edges
+        self.parent_arcs = parent_arcs
+        self.left_arcs = left_arcs
+        self.right_arcs = right_arcs
+        self.source_root_arc = source_root_arc
+        self.tau_arcs = tau_arcs        # List of (leaf,tau) arcs
+
+        self.source = source
+        self.root = root
+        self.tau = tau                  # Node id
+
+
+        # Return a summary
+        return {
+            "edges": self.edges,
+            "inner_edges": self.inner_edges,
+            "parent_arcs": self.parent_arcs,
+            "left_arcs": self.left_arcs,
+            "right_arcs": self.right_arcs,
+            "source_root_arc": self.source_root_arc,
+            "tau_arcs": self.tau_arcs,
+            "tau": self.tau,
+            "source": self.source,
+            "root": self.root,
+        }
+
+    # Parent function
+    def parent_of(self, t: int) -> int:
+        return self.source if t == self.root else t // 2      #a(1) = source, // = integer division
