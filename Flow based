@@ -1,0 +1,211 @@
+import numpy as np
+import gurobipy as gp
+from gurobipy import GRB
+from Flowtree.Structure import TreeStructure
+
+class FlowTreeClassifier:
+    def __init__(self, max_depth: int, timelimit: int = 900, output: bool = True, baseline_acc: float | None = None):
+        self.max_depth = int(max_depth)
+        self.timelimit = int(timelimit)
+        self.output = bool(output)
+        self.baseline_acc = baseline_acc
+
+        # Tree structure
+        self.structure = TreeStructure(max_depth)
+
+        # Data sizes and labels
+        self.n = None
+        self.F = None
+        self.labels = []
+
+        # Solution holders
+        self._b = {}
+        self._za = {}
+        self._zn = {}
+        self._w = {}
+
+        self.trained = False
+        self.mip_gap = None
+        self.obj_val = None
+
+    # Train the flow-based tree
+    def fit(self, x, y_input):
+
+        # Convert input to numpy arrays
+        x_np = np.asarray(x)
+        y_np = np.asarray(y_input, dtype=int)
+
+        # Check if all features are binary
+        if not np.isin(x_np, [0, 1]).all():
+            raise ValueError("FlowTreeClassifier expects binary features")
+
+        self.n, self.F = x_np.shape
+        self.labels = [int(lbl) for lbl in np.unique(y_np)]  # np.unique() sorts unique labels
+
+        # Majority-class baseline
+        if self.baseline_acc is None:
+            counts = np.bincount(y_np - y_np.min())
+            self.baseline_acc = counts.max()
+
+        # Build arcs and nodes on the structure
+        self.structure.build_graph()
+
+        # Build and solve the MIO
+        model, b, za, zn, w = self._build_model(x_np, y_np)     # _build_model is defined further down in this code
+        model.optimize()                                        # solves the MIP corresponding to the MIO
+
+        # Store solution values
+        self.mip_gap = getattr(model, 'MIPGap', None)
+        self.obj_val = model.ObjVal
+        self.bound = model.ObjBound
+        self.runtime = model.Runtime
+
+        self._b = {(t,f): var.X for (t,f), var in b.items()}
+        self._za = {(i,u,v): var.X for (i,u,v), var in za.items()}
+        self._zn = {(i,u,v): var.X for (i,u,v), var in zn.items()}
+        self._w = {(t,k): var.X for (t,k), var in w.items()}
+
+        self.trained = True
+
+        # Print b, za, zn and w
+        if self.output:
+            b_one = [(t, f) for (t, f), value in self._b.items() if round(value) == 1]
+            w_one = [(t, k) for (t, k), value in self._w.items() if round(value) == 1]
+            za_one = [(i, u, v) for (i, u, v), value in self._za.items() if round(value) == 1]
+            zn_one = [(i, u, v) for (i, u, v), value in self._zn.items() if round(value) == 1]
+
+            print("b[t,f] = 1 (splits):", b_one)
+            print("w[t,k] = 1 (leaf labels):", w_one)
+            print("za = 1 (incoming)", za_one)
+            print("zn = 1 (leaf -> sink)", zn_one)
+
+    def _build_model(self, x_np, y_np):
+        model = gp.Model("FlowBasedDecisionTree")
+        model.Params.LogToConsole = 1 if self.output else 0
+        model.Params.TimeLimit = self.timelimit
+
+        # Index sets
+        i_set = range(self.n)           # samples
+        f_set = range(self.F)           # features
+        tb = self.structure.branch_nodes
+        tl = self.structure.leaf_nodes
+        za_index = [(i, u, v) for i in i_set for (u, v) in self.structure.parent_arcs]
+        zn_index = [(i, u, v) for i in i_set for (u, v) in self.structure.tau_arcs]
+
+        # Variables:                                                        # model.add.Vars() creates variable arrays
+
+        # b[t,f] : which feature is chosen at branch t
+        b = model.addVars(tb, f_set, vtype=GRB.BINARY, name="b")  # binary split choice at branch node t over feature f
+
+        # za[i,a,t] : incoming flow on every arc
+        za = model.addVars(za_index, vtype=GRB.CONTINUOUS, lb=0.0, name="za")  # binary flow on every incoming arc (parent -> child)
+
+        # zn[i,t,τ] : flow on leaf -> sink arcs
+        zn = model.addVars(zn_index, vtype=GRB.CONTINUOUS, lb=0.0, name="zn")  # binary flow on (leaf -> tau) arcs
+
+        # w[t,k] : which label k a given leaf predicts
+        w = model.addVars(tl, self.labels, vtype=GRB.BINARY, name="w")  # binary class chosen at each leaf
+
+        parent_of = self.structure.parent_of
+
+        # Correctly classified:
+        correctly_classified = gp.quicksum(zn[i, u, v] for (i, u, v) in zn_index)
+
+        # Minimize normalized misclassification:
+        model.setObjective((1.0 / self.baseline_acc) * (self.n - correctly_classified), GRB.MINIMIZE)
+
+        # Constraints :
+        # (1) Exactly one feature chosen at each branch node
+        model.addConstrs((gp.quicksum(b[t, f] for f in f_set) == 1 for t in tb), name="(1)")
+
+        # (2) Flow conservation at branches: incoming equals sum of outgoing to its child nodes
+        for t in tb:
+            lt = 2 * t
+            rt = 2 * t + 1
+            model.addConstrs((za[i, parent_of(t), t] == za[i, t, rt] + za[i, t, lt] for i in i_set), name="(2)")
+
+        # (3) For leaves: incoming equals leaf -> sink flow
+        for t in tl:
+            model.addConstrs((za[i, parent_of(t), t] == zn[i, t, self.structure.tau] for i in i_set), name="(3)")
+
+        # (4) Each sample can use the source -> root arc at most once
+        model.addConstrs((za[i, self.structure.source, self.structure.root] <= 1 for i in i_set), name="(4)")
+
+        # (5) If x[i,f] == 0 and feature f is chosen at node branch node t, then the sample goes left
+        # (6) If x[i,f] == 1 and feature f is chosen at node branch node t, then the sample goes right
+        for t in tb:
+            lt = 2 * t
+            rt = 2 * t + 1
+
+            model.addConstrs((za[i, t, lt] <= gp.quicksum(b[t, f] for f in f_set if x_np[i, f] == 0) for i in i_set),
+                             name="(5)")
+            model.addConstrs((za[i, t, rt] <= gp.quicksum(b[t, f] for f in f_set if x_np[i, f] == 1) for i in i_set),
+                             name="(6)")
+
+        # (7) Count only if leaf's label matches y[i]
+        for t in tl:
+            model.addConstrs((zn[i, t, self.structure.tau] <= w[t, int(y_np[i])] for i in i_set), name="(7)")
+
+        # (8) Each leaf predicts one and only one class
+        model.addConstrs((gp.quicksum(w[t, k] for k in self.labels) == 1 for t in tl), name="(8)")
+
+        return model, b, za, zn, w
+
+    def predict(self, x):
+        if not self.trained:
+            raise ValueError("Optimizer not trained")
+
+        # convert to numpy arrays
+        x_np = np.asarray(x)
+
+        # Which feature per branch
+        chosen_f = {}
+        for t in self.structure.branch_nodes:
+            picked = [f for f in range(self.F) if round(self._b.get((t,f),0.0)) == 1]
+            chosen_f[t] = picked[0] if picked else 0        # måske jeg skal ændre det her til Error
+
+        # Which label per leaf
+        chosen_k = {}
+        for t in self.structure.leaf_nodes:
+            ks = [k for k in self.labels if round(self._w.get((t,k),0.0)) == 1]
+            chosen_k[t] = ks[0] if ks else self.labels[0]
+
+        predictions = []
+        for x_i in x_np:                                  # Iterate rows
+            node = self.structure.root                    # Start at the root
+            while node in self.structure.branch_nodes:
+                f = chosen_f[node]
+                node = 2 * node if x_i[f] == 0 else 2 * node + 1
+            predictions.append(chosen_k[node])
+
+        return np.array(predictions)
+
+    def leaf_sample_counts(self):
+        if not self.trained:
+            raise ValueError("Model has not been trained")
+
+        counts = {}
+        tau = self.structure.tau
+
+        for t in self.structure.leaf_nodes:
+            # Count samples that flow to leaf t → τ
+            count_t = sum(
+                round(self._zn.get((i, t, tau), 0)) == 1
+                for i in range(self.n)
+            )
+            counts[t] = count_t
+
+        return counts
+
+    # Summary of which feature each branch node split on
+    def split_feature_map(self, feature_names = None):
+        if not self.trained:
+            raise ValueError("Model has not been trained")
+        if feature_names is not None and len(feature_names) != self.F:
+            raise ValueError("Number of feature names does not match F")
+
+        splits = {}
+        for (t,f), value in self._b.items():
+            if round(value) == 1:
+                splits[t] = feature_names[f] if feature_names else f
+        return dict(sorted(splits.items()))
