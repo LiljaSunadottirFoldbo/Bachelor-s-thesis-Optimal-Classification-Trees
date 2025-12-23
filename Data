@@ -1,0 +1,91 @@
+import pandas as pd
+import numpy as np
+from sklearn.model_selection import StratifiedShuffleSplit, train_test_split
+
+url = "https://archive.ics.uci.edu/static/public/144/data.csv"
+
+column_names = [
+    "checking_status",
+    "duration",
+    "credit_history",
+    "purpose",
+    "credit_amount",
+    "savings_status",
+    "employment_status",
+    "installment_rate",
+    "personal_status",
+    "other_debtors",
+    "residence_since",
+    "property",
+    "age",
+    "other_installment_plans",
+    "housing",
+    "existing_credits",
+    "job",
+    "num_dependents",
+    "telephone",
+    "foreign_worker",
+    "target"
+]
+
+df_raw = pd.read_csv(url)
+df_raw.columns = column_names
+
+numeric_columns = [
+    "duration",
+    "credit_amount",
+    "age"
+]
+
+# compute thresholds on the full data set
+global_thresholds = {}
+for col in numeric_columns:
+    q33, q66 = df_raw[col].quantile([0.33, 0.66])
+    global_thresholds[col] = (q33, q66)
+
+# Stratified subsample from df_raw
+subsampler = StratifiedShuffleSplit(n_splits=1, train_size=100, random_state=1)
+
+splitter = subsampler.split(df_raw, df_raw["target"])
+sample_index, _ = next(splitter)
+df_sample = df_raw.iloc[sample_index].copy()
+
+# Binary variables
+df_sample["telephone"]       = df_sample["telephone"].map({"A191": 0, "A192": 1}).astype(int)
+df_sample["foreign_worker"]  = df_sample["foreign_worker"].map({"A202": 0, "A201": 1}).astype(int)
+df_sample["num_dependents"]  = (df_sample["num_dependents"] == 2).astype(int)  #0 -> one dependent, 1-> two dependents
+
+# Categorical columns
+categorical_columns = sorted([
+    col for col in df_sample.columns
+    if col not in numeric_columns + ["telephone", "foreign_worker", "num_dependents", "target"]
+])
+
+# one hot encode categorical features
+X_cat = pd.get_dummies(df_sample.drop(columns=["target"]),
+                       columns=categorical_columns,
+                       drop_first=False)
+
+# separate numeric features into bins
+X_bin = X_cat.copy()
+
+for col in numeric_columns:
+    q33, q66 = global_thresholds[col]
+
+    X_bin[f"{col}_low"]     = (X_bin[col] <= q33).astype(int)
+    X_bin[f"{col}_mid"]     = ((X_bin[col] > q33) & (X_bin[col] <= q66)).astype(int)
+    X_bin[f"{col}_high"]     = (X_bin[col] > q66).astype(int)
+
+    X_bin = X_bin.drop(columns=[col])
+
+# final outputs
+feature_names = sorted(list(X_bin.columns))
+X = X_bin[feature_names].values.astype(int)
+y = (df_sample["target"] == 1).astype(int).values
+
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y,
+    test_size=0.30,
+    stratify=y,
+    random_state=1
+)
