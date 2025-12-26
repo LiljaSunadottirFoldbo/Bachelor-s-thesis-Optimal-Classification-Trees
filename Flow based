@@ -162,7 +162,7 @@ class FlowTreeClassifier:
         chosen_f = {}
         for t in self.structure.branch_nodes:
             picked = [f for f in range(self.F) if round(self._b.get((t,f),0.0)) == 1]
-            chosen_f[t] = picked[0] if picked else 0        # måske jeg skal ændre det her til Error
+            chosen_f[t] = picked[0] if picked else 0        
 
         # Which label per leaf
         chosen_k = {}
